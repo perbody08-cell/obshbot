@@ -1,55 +1,109 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select
-from database.models import User, Message, DirectMessage, BusinessConnectionLog
-from config import settings
+from database.crud import get_or_create_user
+from sqlalchemy import select
+from database.models import Contact
 
 
-def is_admin(user_id: int) -> bool:
-    return user_id in settings.ADMIN_IDS
-
-
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админ-панель"""
-
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Доступ запрещён")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("📊 Общая статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
-        [InlineKeyboardButton("💼 Business логи", callback_data="admin_business_logs")],
-        [InlineKeyboardButton("🤖 Direct статистика", callback_data="admin_direct_stats")],
-        [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
-    ]
-
-    await update.message.reply_text("🔐 Админ-панель", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Общая статистика"""
+async def contacts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню управления контактами (только для Business Mode)"""
 
     query = update.callback_query
     await query.answer()
 
     session: AsyncSession = context.bot_data["db_session"]
+    user = await get_or_create_user(session, telegram_id=update.effective_user.id)
 
-    users_count = await session.execute(select(func.count(User.id)))
-    active_business = await session.execute(
-        select(func.count(User.id)).where(User.is_business_connected == True)
+    if not user.is_business_connected:
+        await query.edit_message_text(
+            "💼 Business Mode не подключён.
+
+"
+            "Подключите его в настройках Telegram Business, чтобы управлять контактами.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="settings")]])
+        )
+        return
+
+    result = await session.execute(
+        select(Contact).where(Contact.owner_id == user.id).order_by(Contact.created_at.desc()).limit(20)
     )
-    total_messages = await session.execute(select(func.count(Message.id)))
-    total_direct = await session.execute(select(func.count(DirectMessage.id)))
+    contacts = result.scalars().all()
+
+    if not contacts:
+        text = "👥 У вас пока нет контактов.\n\nКонтакты появятся автоматически, когда кто-то напишет вам."
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="settings")]]
+    else:
+        text = "👥 Ваши контакты (Business Mode):\n\n"
+        keyboard = []
+        for c in contacts:
+            status = "🟢" if c.is_active else "🔴"
+            name = c.first_name or c.username or f"ID:{c.telegram_user_id}"
+            text += f"{status} {name} ({c.relationship_type})\n"
+            keyboard.append([InlineKeyboardButton(
+                f"{status} {name}",
+                callback_data=f"contact_{c.id}"
+            )])
+
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings")])
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def contact_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Детали контакта"""
+
+    query = update.callback_query
+    await query.answer()
+
+    contact_id = int(query.data.split("_")[1])
+    session: AsyncSession = context.bot_data["db_session"]
+
+    result = await session.execute(select(Contact).where(Contact.id == contact_id))
+    contact = result.scalar_one_or_none()
+
+    if not contact:
+        await query.edit_message_text("Контакт не найден")
+        return
+
+    name = contact.first_name or contact.username or f"ID:{contact.telegram_user_id}"
 
     text = (
-        f"📊 Общая статистика\n\n"
-        f"Всего пользователей: {users_count.scalar()}\n"
-        f"Business подключён: {active_business.scalar()}\n"
-        f"Business сообщений: {total_messages.scalar()}\n"
-        f"Direct сообщений: {total_direct.scalar()}\n"
-        f"Всего сообщений: {total_messages.scalar() + total_direct.scalar()}"
+        f"👤 {name}\n\n"
+        f"Отношения: {contact.relationship_type}\n"
+        f"Статус: {'🟢 Бот отвечает' if contact.is_active else '🔴 Бот отключён'}\n"
+        f"Заметки: {contact.notes or 'Нет'}\n"
+        f"Извлечённый стиль: {contact.extracted_style or 'Не анализировался'}"
     )
 
-    await query.edit_message_text(text)
+    keyboard = [
+        [InlineKeyboardButton(
+            "🔴 Отключить бота" if contact.is_active else "🟢 Включить бота",
+            callback_data=f"toggle_contact_{contact.id}"
+        )],
+        [InlineKeyboardButton("🏷️ Тип отношений", callback_data=f"rel_contact_{contact.id}")],
+        [InlineKeyboardButton("📝 Заметки", callback_data=f"notes_contact_{contact.id}")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="contacts")]
+    ]
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def toggle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включить/отключить бота для контакта"""
+
+    query = update.callback_query
+    await query.answer()
+
+    contact_id = int(query.data.split("_")[2])
+    session: AsyncSession = context.bot_data["db_session"]
+
+    from database.crud import update_contact
+    result = await session.execute(select(Contact).where(Contact.id == contact_id))
+    contact = result.scalar_one()
+
+    await update_contact(session, contact_id, is_active=not contact.is_active)
+
+    # Перезагружаем детали
+    update.callback_query.data = f"contact_{contact_id}"
+    await contact_detail(update, context)
