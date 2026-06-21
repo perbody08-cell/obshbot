@@ -1,175 +1,156 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, BigInteger, Float
-from sqlalchemy.ext.asyncio import AsyncAttrs
-from sqlalchemy.orm import declarative_base, relationship
-from datetime import datetime
-
-Base = declarative_base()
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, unique=True, nullable=False)
-    username = Column(String(100))
-    first_name = Column(String(100))
-    last_name = Column(String(100))
-
-    # Business Mode
-    business_connection_id = Column(String(255), unique=True)
-    is_business_connected = Column(Boolean, default=False)
-
-    # Direct Mode (общение с ботом)
-    direct_mode_enabled = Column(Boolean, default=True)
-    direct_persona = Column(Text)  # Персона для прямого общения
-
-    # Настройки
-    chosen_prompt_id = Column(Integer, ForeignKey("prompts.id"), default=1)
-    custom_prompt = Column(Text)
-    global_knowledge = Column(JSON, default=dict)
-
-    # LLM
-    llm_provider = Column(String(50), default="mock")
-    llm_api_key = Column(String(500))
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    contacts = relationship("Contact", back_populates="owner", lazy="selectin")
-    chat_sessions = relationship("ChatSession", back_populates="owner", lazy="selectin")
-    direct_chats = relationship("DirectChat", back_populates="user", lazy="selectin")
-    prompt = relationship("Prompt", lazy="selectin")
+from telegram import Update
+from telegram.ext import ContextTypes
+from sqlalchemy.ext.asyncio import AsyncSession
+from database.crud import (
+    get_user_by_business_conn, get_or_create_contact, get_or_create_chat_session,
+    get_chat_history, add_message, log_business_connection
+)
+from services.llm import get_llm
+from services.prompt_builder import PromptBuilder
+from config import settings
 
 
-class Contact(Base):
-    __tablename__ = "contacts"
+async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик сообщений из Business Connection"""
 
-    id = Column(Integer, primary_key=True)
-    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    if not update.business_message:
+        return
 
-    telegram_user_id = Column(BigInteger)
-    username = Column(String(100))
-    first_name = Column(String(100))
-    last_name = Column(String(100))
-    phone = Column(String(50))
+    if not settings.ENABLE_BUSINESS_MODE:
+        return
 
-    relationship_type = Column(String(50), default="unknown")
-    notes = Column(Text)
-    extracted_style = Column(JSON, default=dict)
+    business_msg = update.business_message
+    business_conn_id = business_msg.business_connection_id
 
-    is_active = Column(Boolean, default=True)
-    use_custom_prompt = Column(Boolean, default=False)
-    custom_prompt = Column(Text)
+    session: AsyncSession = context.bot_data["db_session"]
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    user = await get_user_by_business_conn(session, business_conn_id)
 
-    owner = relationship("User", back_populates="contacts")
-    messages = relationship("Message", back_populates="contact", lazy="selectin")
+    if not user:
+        return
 
+    # Инфо о контакте (кто пишет владельцу)
+    contact_user = business_msg.from_user
+    contact = await get_or_create_contact(
+        session,
+        owner_id=user.id,
+        telegram_user_id=contact_user.id,
+        username=contact_user.username,
+        first_name=contact_user.first_name,
+        last_name=contact_user.last_name
+    )
 
-class ChatSession(Base):
-    __tablename__ = "chat_sessions"
+    if not contact.is_active:
+        return
 
-    id = Column(Integer, primary_key=True)
-    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    contact_id = Column(Integer, ForeignKey("contacts.id"))
-    chat_id = Column(BigInteger, nullable=False)
+    chat_session = await get_or_create_chat_session(
+        session,
+        owner_id=user.id,
+        chat_id=business_msg.chat.id,
+        contact_id=contact.id,
+        session_type="business"
+    )
 
-    session_type = Column(String(20), default="business")  # business, direct
-    is_active = Column(Boolean, default=True)
-    last_message_at = Column(DateTime)
+    # Сохраняем входящее
+    await add_message(
+        session,
+        session_id=chat_session.id,
+        sender_type="contact",
+        text=business_msg.text or "",
+        contact_id=contact.id
+    )
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # Получаем историю
+    history = await get_chat_history(session, chat_session.id, limit=settings.MAX_CONTEXT_MESSAGES)
+    history_dicts = [{"sender_type": h.sender_type, "text": h.text} for h in history]
 
-    owner = relationship("User", back_populates="chat_sessions")
-    messages = relationship("Message", back_populates="session", lazy="selectin")
+    # Строим промпт
+    system_prompt = PromptBuilder.build_business_prompt(
+        user=user,
+        contact=contact,
+        prompt=user.prompt
+    )
+    messages = PromptBuilder.build_messages(history_dicts, business_msg.text or "")
 
+    # Генерируем ответ
+    llm = get_llm(user.llm_provider, user.llm_api_key)
 
-class DirectChat(Base):
-    """Прямое общение пользователя с ботом (не Business)"""
-    __tablename__ = "direct_chats"
+    try:
+        response_text = await llm.generate(
+            system_prompt, 
+            messages, 
+            mode="business",
+            user_settings={"user_id": user.id, "contact_id": contact.id}
+        )
 
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+        # Отправляем от имени владельца
+        await context.bot.send_message(
+            chat_id=business_msg.chat.id,
+            text=response_text,
+            business_connection_id=business_conn_id
+        )
 
-    # Настройки персоны для этого чата
-    persona_name = Column(String(100), default="Помощник")
-    persona_description = Column(Text)
-    system_prompt = Column(Text)
+        # Сохраняем ответ
+        await add_message(
+            session,
+            session_id=chat_session.id,
+            sender_type="bot",
+            text=response_text,
+            contact_id=contact.id,
+            llm_model=user.llm_provider
+        )
 
-    # Контекст
-    context_summary = Column(Text)  # Сводка предыдущих разговоров
+    except Exception as e:
+        print(f"Business LLM Error: {e}")
 
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    user = relationship("User", back_populates="direct_chats")
-    messages = relationship("DirectMessage", back_populates="chat", lazy="selectin")
-
-
-class Message(Base):
-    __tablename__ = "messages"
-
-    id = Column(Integer, primary_key=True)
-    session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=False)
-    contact_id = Column(Integer, ForeignKey("contacts.id"))
-
-    sender_type = Column(String(20), nullable=False)  # owner, contact, bot
-    text = Column(Text)
-
-    tokens_input = Column(Integer)
-    tokens_output = Column(Integer)
-    llm_model = Column(String(100))
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    session = relationship("ChatSession", back_populates="messages")
-    contact = relationship("Contact", back_populates="messages")
-
-
-class DirectMessage(Base):
-    """Сообщения в прямом чате с ботом"""
-    __tablename__ = "direct_messages"
-
-    id = Column(Integer, primary_key=True)
-    chat_id = Column(Integer, ForeignKey("direct_chats.id"), nullable=False)
-
-    sender_type = Column(String(20), nullable=False)  # user, bot
-    text = Column(Text)
-
-    tokens_input = Column(Integer)
-    tokens_output = Column(Integer)
-    llm_model = Column(String(100))
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    chat = relationship("DirectChat", back_populates="messages")
+    from datetime import datetime
+    chat_session.last_message_at = datetime.utcnow()
+    await session.commit()
 
 
-class Prompt(Base):
-    __tablename__ = "prompts"
+async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка подключения/отключения Business Connection"""
 
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), nullable=False)
-    description = Column(Text)
-    system_prompt = Column(Text, nullable=False)
-    category = Column(String(50), default="business")  # business, direct, universal
-    is_custom = Column(Boolean, default=False)
-    is_active = Column(Boolean, default=True)
+    if not update.business_connection:
+        return
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    conn = update.business_connection
+    session: AsyncSession = context.bot_data["db_session"]
 
-    users = relationship("User", back_populates="prompt")
+    from database.crud import get_or_create_user, update_business_connection
 
+    user = await get_or_create_user(
+        session,
+        telegram_id=conn.user_chat_id,
+        first_name=conn.user.first_name if conn.user else None
+    )
 
-class BusinessConnectionLog(Base):
-    __tablename__ = "business_connection_logs"
+    if conn.is_enabled:
+        await update_business_connection(session, user.id, conn.id)
+        await log_business_connection(session, user.id, conn.id, "connected", {
+            "can_reply": conn.can_reply,
+            "user_chat_id": conn.user_chat_id
+        })
 
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    business_connection_id = Column(String(255))
-    action = Column(String(50))
-    details = Column(JSON)
-    created_at = Column(DateTime, default=datetime.utcnow)
+        await context.bot.send_message(
+            chat_id=conn.user_chat_id,
+            text="""✅ Business-аккаунт подключен!
+
+Бот теперь будет отвечать на сообщения от вашего имени в личных чатах.
+
+📋 Что настроить:
+• Стиль ответов — как бот будет писать от вашего имени
+• База знаний — информация о вас для правдоподобных ответов
+• Контакты — для кого включить/выключить автоответ
+
+⚠️ Сейчас работает в тестовом режиме (заглушка LLM)."""
+        )
+    else:
+        await log_business_connection(session, user.id, conn.id, "disconnected")
+        user.is_business_connected = False
+        await session.commit()
+
+        await context.bot.send_message(
+            chat_id=conn.user_chat_id,
+            text="❌ Business-аккаунт отключен. Бот больше не отвечает за вас."
+        )
