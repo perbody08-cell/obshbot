@@ -7,7 +7,7 @@ from database.crud import (
 )
 from services.llm import get_llm
 from services.prompt_builder import PromptBuilder
-from config import settings
+from settings import settings
 
 
 async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -3,7 +3,7 @@ from telegram.ext import ContextTypes
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select
 from database.models import User, Message, DirectMessage, BusinessConnectionLog
-from config import settings
+from settings import settings
 
 
 def is_admin(user_id: int) -> bool:

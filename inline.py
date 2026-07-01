@@ -1,130 +1,279 @@
-from telegram import Update
-from telegram.ext import ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes, ConversationHandler
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.crud import (
-    get_or_create_user, get_or_create_direct_chat, get_direct_chat_history,
-    add_direct_message, update_direct_chat
+    get_prompts, update_user_prompt, update_user_knowledge, get_user_stats,
+    get_or_create_user
 )
-from services.llm import get_llm
-from services.prompt_builder import PromptBuilder
-from config import settings
+from database.models import User
+
+ENTERING_CUSTOM_PROMPT, ENTERING_KNOWLEDGE = range(2)
 
 
-async def handle_direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик прямых сообщений пользователю боту (не Business)"""
+async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главное меню настроек"""
 
-    if not settings.ENABLE_DIRECT_MODE:
-        return
+    query = update.callback_query
+    if query:
+        await query.answer()
 
-    # Пропускаем команды и callback
-    if update.message and update.message.text and update.message.text.startswith("/"):
-        return
+    from keyboards.inline import settings_menu_keyboard
 
-    # Пропускаем сообщения из Business Connection
-    if update.business_message:
-        return
+    text = """⚙️ Настройки
 
-    # Работаем только в личных чатах
-    if update.effective_chat.type != "private":
-        return
+Здесь вы можете настроить оба режима работы бота:
 
-    session: AsyncSession = context.bot_data["db_session"]
+💼 Business Mode — как бот отвечает от вашего имени
+🤖 Direct Mode — как бот общается с вами напрямую"""
 
-    # Получаем или создаём пользователя
-    user = await get_or_create_user(
-        session,
-        telegram_id=update.effective_user.id,
-        username=update.effective_user.username,
-        first_name=update.effective_user.first_name,
-        last_name=update.effective_user.last_name
-    )
-
-    # Проверяем, включён ли Direct Mode
-    if not user.direct_mode_enabled:
-        return
-
-    # Получаем или создаём direct чат
-    chat = await get_or_create_direct_chat(session, user.id)
-
-    # Сохраняем сообщение пользователя
-    await add_direct_message(
-        session,
-        chat_id=chat.id,
-        sender_type="user",
-        text=update.message.text or ""
-    )
-
-    # Показываем typing
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing"
-    )
-
-    # Получаем историю
-    history = await get_direct_chat_history(session, chat.id, limit=settings.MAX_CONTEXT_MESSAGES)
-    history_dicts = [{"sender_type": h.sender_type, "text": h.text} for h in history]
-
-    # Строим промпт
-    system_prompt = PromptBuilder.build_direct_prompt(
-        user=user,
-        chat=chat,
-        prompt=user.prompt
-    )
-    messages = PromptBuilder.build_messages(history_dicts, update.message.text or "")
-
-    # Генерируем ответ
-    llm = get_llm(user.llm_provider, user.llm_api_key)
-
-    try:
-        response_text = await llm.generate(
-            system_prompt,
-            messages,
-            mode="direct",
-            user_settings={"user_id": user.id, "chat_id": chat.id}
-        )
-
-        # Отправляем ответ
-        await update.message.reply_text(response_text)
-
-        # Сохраняем ответ бота
-        await add_direct_message(
-            session,
-            chat_id=chat.id,
-            sender_type="bot",
-            text=response_text,
-            llm_model=user.llm_provider
-        )
-
-    except Exception as e:
-        print(f"Direct LLM Error: {e}")
-        await update.message.reply_text(
-            "⚠️ Произошла ошибка при генерации ответа. Попробуйте позже."
-        )
+    if query:
+        await query.edit_message_text(text, reply_markup=settings_menu_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=settings_menu_keyboard())
 
 
-async def direct_mode_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Информация о Direct Mode"""
+async def select_prompt_business(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор промпта для Business Mode"""
 
     query = update.callback_query
     await query.answer()
 
-    text = """🤖 Direct Mode — общение с ботом
+    session: AsyncSession = context.bot_data["db_session"]
+    prompts = await get_prompts(session, category="business")
 
-В этом режиме вы просто общаетесь со мной как с AI-ассистентом.
+    keyboard = []
+    for prompt in prompts:
+        keyboard.append([InlineKeyboardButton(
+            f"{prompt.name}",
+            callback_data=f"prompt_business_{prompt.id}"
+        )])
 
-💡 Возможности:
-• Задавайте любые вопросы
-• Просите помочь с задачами
-• Обсуждайте идеи
-• Практикуйте языки
-• Получайте советы
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings")])
 
-⚙️ Настройки:
-• Выберите стиль общения
-• Настройте свою персону
-• Укажите интересы для персонализации
+    await query.edit_message_text(
+        "🎭 Выберите стиль для Business Mode:
 
-💼 Также доступен Business Mode — бот будет отвечать от вашего имени в личных чатах через Telegram Business."""
+"
+        "Это определит, как бот будет отвечать от вашего имени в личных чатах.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-    from keyboards.inline import main_menu_keyboard
-    await query.edit_message_text(text, reply_markup=main_menu_keyboard())
+
+async def select_prompt_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор промпта для Direct Mode"""
+
+    query = update.callback_query
+    await query.answer()
+
+    session: AsyncSession = context.bot_data["db_session"]
+    prompts = await get_prompts(session, category="direct")
+
+    keyboard = []
+    for prompt in prompts:
+        keyboard.append([InlineKeyboardButton(
+            f"{prompt.name}",
+            callback_data=f"prompt_direct_{prompt.id}"
+        )])
+
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings")])
+
+    await query.edit_message_text(
+        "🎭 Выберите стиль для Direct Mode:
+
+"
+        "Это определит, как я буду общаться с вами напрямую.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def prompt_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователь выбрал промпт"""
+
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.split("_")
+    mode = data[1]  # business или direct
+    prompt_id = int(data[2])
+
+    session: AsyncSession = context.bot_data["db_session"]
+    user = await get_or_create_user(session, telegram_id=update.effective_user.id)
+
+    from database.crud import get_prompt_by_id
+    prompt = await get_prompt_by_id(session, prompt_id)
+
+    await update_user_prompt(session, user.id, prompt_id)
+
+    mode_text = "Business Mode" if mode == "business" else "Direct Mode"
+
+    await query.edit_message_text(
+        f"✅ Стиль «{prompt.name}» выбран для {mode_text}!
+
+"
+        f"Описание: {prompt.description or 'Нет описания'}
+
+"
+        f"Промпт: {prompt.system_prompt[:200]}...",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="settings")]])
+    )
+
+
+async def custom_prompt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало ввода кастомного промпта"""
+
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        """✏️ Напишите свой промпт
+
+Опишите, как бот должен отвечать.
+
+💼 Для Business Mode:
+«Отвечай кратко, используй сленг типа 'крч', 'типа'. 
+Любишь эмодзи 😎. С друзьями — неформально.»
+
+🤖 Для Direct Mode:
+«Общайся как мудрый наставник, давай развёрнутые 
+советы, используй примеры из жизни.»
+
+Отправьте текст или /cancel для отмены."""
+    )
+
+    return ENTERING_CUSTOM_PROMPT
+
+
+async def custom_prompt_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохранение кастомного промпта"""
+
+    session: AsyncSession = context.bot_data["db_session"]
+    user = await get_or_create_user(session, telegram_id=update.effective_user.id)
+    user.custom_prompt = update.message.text
+    await session.commit()
+
+    await update.message.reply_text(
+        f"✅ Промпт сохранён!
+
+Текст: {update.message.text[:200]}...",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В настройки", callback_data="settings")]])
+    )
+
+    return ConversationHandler.END
+
+
+async def knowledge_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню базы знаний"""
+
+    query = update.callback_query
+    await query.answer()
+
+    session: AsyncSession = context.bot_data["db_session"]
+    user = await get_or_create_user(session, telegram_id=update.effective_user.id)
+    knowledge = user.global_knowledge or {}
+
+    knowledge_text = "\n".join([f"• {k}: {v}" for k, v in knowledge.items()]) or "Пока нет записей."
+
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить/изменить", callback_data="knowledge_edit")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="settings")]
+    ]
+
+    await query.edit_message_text(
+        f"🧠 База знаний
+
+"
+        f"Эта информация используется в обоих режимах:
+
+"
+        f"{knowledge_text}
+
+"
+        f"💼 Business: помогает боту отвечать правдоподобно от вашего имени
+"
+        f"🤖 Direct: помогает мне лучше понимать ваш контекст",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def knowledge_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Редактирование базы знаний"""
+
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        """📝 Отправьте информацию о себе
+
+Формат: Ключ - Значение (каждая строка — новый пункт)
+
+Пример:
+Работа - Программист в Яндексе
+Город - Москва
+Хобби - Играю в футбол по выходным
+Семья - Женат, двое детей
+Возраст - 28 лет
+Интересы - AI, путешествия, кулинария
+
+Отправьте текст или /cancel"""
+    )
+
+    return ENTERING_KNOWLEDGE
+
+
+async def knowledge_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохранение базы знаний"""
+
+    session: AsyncSession = context.bot_data["db_session"]
+    user = await get_or_create_user(session, telegram_id=update.effective_user.id)
+
+    knowledge = {}
+    for line in update.message.text.split("\n"):
+        if " - " in line:
+            key, value = line.split(" - ", 1)
+            knowledge[key.strip()] = value.strip()
+
+    await update_user_knowledge(session, user.id, knowledge)
+
+    await update.message.reply_text(
+        f"✅ База знаний обновлена! ({len(knowledge)} пунктов)",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В настройки", callback_data="settings")]])
+    )
+
+    return ConversationHandler.END
+
+
+async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика пользователя"""
+
+    query = update.callback_query
+    await query.answer()
+
+    session: AsyncSession = context.bot_data["db_session"]
+    user = await get_or_create_user(session, telegram_id=update.effective_user.id)
+    stats = await get_user_stats(session, user.id)
+
+    await query.edit_message_text(
+        f"📊 Статистика
+
+"
+        f"💼 Business Mode:
+"
+        f"  Контактов: {stats['contacts']}
+"
+        f"  Сессий: {stats['sessions']}
+"
+        f"  Сообщений: {stats['messages']}
+"
+        f"  Подключен: {'✅' if user.is_business_connected else '❌'}
+
+"
+        f"🤖 Direct Mode:
+"
+        f"  Сообщений: {stats['direct_messages']}
+"
+        f"  Включён: {'✅' if user.direct_mode_enabled else '❌'}
+
+"
+        f"⚙️ LLM: {user.llm_provider}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="settings")]])
+    )
